@@ -1,23 +1,18 @@
 /**
  * @file gpu_lib.cu
- * @brief Eliminação gaussiana com duas versões paralelas: multithread no host
- *        (Intel Intrinsics AVX/FMA + pthreads) e na GPU (CUDA).
+ * @brief Eliminação gaussiana com duas versões paralelas: multithread no
+ *        host (pthreads, em C puro) e na GPU (CUDA).
  *
  * Implementa as funções processaVetoresThread e processaVetoresGPU, que
  * transformam a matriz A em uma matriz triangular superior, zerando os
  * elementos abaixo da diagonal principal, mantendo o sistema Ax = b íntegro.
  *
  * processaVetoresThread:
- * - Usa instruções AVX/FMA (Intel Intrinsics) na eliminação de cada linha,
- *   com acesso ALINHADO à memória (_mm256_load_ps/_mm256_store_ps): cada
- *   linha é percorrida em escalar até a primeira coluna múltipla de 8
- *   (peeling) e, a partir daí, em blocos vetoriais alinhados de 8 floats,
- *   já que aligned_alloc(32,...) garante que cada linha começa em endereço
- *   múltiplo de 32 bytes (para n múltiplo de 8).
- * - A atualização de cada linha usa FMA (_mm256_fnmadd_ps) em uma única
- *   instrução de multiplicação-subtração.
  * - Paraleliza o passo de eliminação entre nThreads threads POSIX, cada uma
  *   responsável por um subconjunto de linhas (distribuição round-robin).
+ * - A atualização de cada linha é feita em laço escalar simples, sem uso de
+ *   instruções vetoriais explícitas (Intel Intrinsics), por incompatibilidade
+ *   do NVCC/GCC instalados nos servidores IAC e IAC2.
  * - O pivotamento parcial (escolha da melhor linha) é feito de forma
  *   sequencial no host, pois seu custo é O(n) por passo, desprezível frente
  *   ao custo O(n^2) da eliminação.
@@ -44,17 +39,8 @@
  *   erro nesse caso. Use matrizes de teste bem-condicionadas (por exemplo,
  *   diagonalmente dominantes) para evitar esse problema.
  *
- * Compilação (ver Makefile fornecido pelo professor):
+ * Compilação (Makefile original do professor):
  * nvcc -lineinfo -lm -o equation equation_test.cu gpu_lib.cu
- *
- * Observação sobre AVX/FMA + nvcc:
- * As funções que usam intrinsics (_mm256_*) foram marcadas com
- * __attribute__((target("avx,fma"))) para que o código compile e gere
- * instruções AVX/FMA mesmo que a linha de compilação do nvcc não inclua
- * -mavx/-march=native explicitamente (testado e validado com gcc puro,
- * sem nenhuma flag de AVX na linha de comando). Caso o nvcc da máquina de
- * testes não aceite esse atributo, basta adicionar ao Makefile:
- *     CUDA_FLAGS += -Xcompiler -mavx -Xcompiler -mfma
  *
  * Códigos de erro:
  *  - 10: pivô nulo ou próximo de zero (processaVetoresThread)
@@ -68,7 +54,6 @@
 #include <stdlib.h>
 #include <math.h>
 #include <pthread.h>
-#include <immintrin.h>
 #include <cuda_runtime.h>
 #include "comum.h"
 #include "gpu.h"
@@ -104,13 +89,13 @@
 
 /*
  * ===========================================================================
- * PARTE 1: processaVetoresThread (host, multithread + AVX/FMA)
+ * PARTE 1: processaVetoresThread (host, multithread com pthreads)
  * ===========================================================================
  */
 
 /**
- * @brief Função executada por cada thread POSIX: elimina, com AVX/FMA, o
- *        subconjunto de linhas que coube a ela em um determinado passo.
+ * @brief Função executada por cada thread POSIX: elimina o subconjunto de
+ *        linhas que coube a ela em um determinado passo.
  *
  * As linhas são distribuídas entre as threads de forma intercalada
  * (round-robin): a thread de id "threadId" cuida das linhas
@@ -121,7 +106,6 @@
  * @param arg ponteiro para um threadArgs_t (ver comum.h) com os dados do passo
  * @return NULL
  */
-__attribute__((target("avx,fma")))
 static void *threadElimina(void *arg) {
     threadArgs_t *targs = (threadArgs_t *)arg;
 
@@ -138,33 +122,15 @@ static void *threadElimina(void *arg) {
 
         data_t *linhaAtual = &matriz(hmA, linha, 0, nIncognitas);
         data_t multiplicador = linhaAtual[passo - 1] / pivo;
-        __m256 vecMult = _mm256_set1_ps(multiplicador);
 
-        int coluna = passo;
-
-        /* peeling escalar até alinhar a 32 bytes (8 floats) */
-        int colunaAlinhada = ((coluna + 7) / 8) * 8;
-        for (; coluna < colunaAlinhada && coluna < nIncognitas; coluna++) {
-            linhaAtual[coluna] -= linhaPivo[coluna] * multiplicador;
-        }
-
-        /* bloco vetorial alinhado, com FMA */
-        for (; coluna <= nIncognitas - 8; coluna += 8) {
-            __m256 vecLP = _mm256_load_ps(&linhaPivo[coluna]);
-            __m256 vecLA = _mm256_load_ps(&linhaAtual[coluna]);
-            __m256 vecRes = _mm256_fnmadd_ps(vecLP, vecMult, vecLA);
-            _mm256_store_ps(&linhaAtual[coluna], vecRes);
-        }
-
-        /* resto escalar final (caso nIncognitas não seja múltiplo de 8) */
-        for (; coluna < nIncognitas; coluna++) {
+        for (int coluna = passo; coluna < nIncognitas; coluna++) {
             linhaAtual[coluna] -= linhaPivo[coluna] * multiplicador;
         }
 
         /* força zero exato na coluna do pivô */
         linhaAtual[passo - 1] = 0.0f;
 
-        /* atualiza B (escalar, um único valor por linha) */
+        /* atualiza B (um único valor por linha) */
         hvB[linha] -= hvB[passo - 1] * multiplicador;
     }
 
@@ -173,14 +139,12 @@ static void *threadElimina(void *arg) {
 
 /**
  * @brief Aplica eliminação gaussiana com pivotamento parcial (sequencial) e
- *        eliminação vetorizada (AVX/FMA) distribuída entre nThreads threads
- *        POSIX no host.
+ *        eliminação distribuída entre nThreads threads POSIX no host.
  *
  * @param hmA          matriz A (host)
  * @param hvB          vetor B (host)
  * @param nIncognitas  número de incógnitas
  */
-__attribute__((target("avx,fma")))
 void processaVetoresThread(data_t *hmA, data_t *hvB, int nIncognitas) {
 
     pthread_t   *threads = (pthread_t *)malloc(sizeof(pthread_t) * nThreads);
@@ -209,14 +173,7 @@ void processaVetoresThread(data_t *hmA, data_t *hvB, int nIncognitas) {
             data_t *linha1 = &matriz(hmA, passo - 1, 0, nIncognitas);
             data_t *linha2 = &matriz(hmA, melhorLinha, 0, nIncognitas);
 
-            int j = 0;
-            for (; j <= nIncognitas - 8; j += 8) {
-                __m256 v1 = _mm256_load_ps(&linha1[j]);
-                __m256 v2 = _mm256_load_ps(&linha2[j]);
-                _mm256_store_ps(&linha1[j], v2);
-                _mm256_store_ps(&linha2[j], v1);
-            }
-            for (; j < nIncognitas; j++) {
+            for (int j = 0; j < nIncognitas; j++) {
                 data_t tmp = linha1[j];
                 linha1[j] = linha2[j];
                 linha2[j] = tmp;
