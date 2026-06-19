@@ -32,12 +32,15 @@
  *   padrão de "grid-stride loop", o que funciona corretamente independente
  *   do tamanho do sistema e da configuração de blocos/threads escolhida na
  *   linha de comando (-t e -g).
- * - Por simplicidade e para minimizar o número de cópias/transferências
- *   Host<->Device por passo (o que prejudicaria o speedup que é o objetivo
- *   do trabalho), a versão GPU NÃO faz pivotamento parcial. Ela apenas
- *   verifica se o pivô está nulo (ou muito próximo de zero) e aborta com
- *   erro nesse caso. Use matrizes de teste bem-condicionadas (por exemplo,
- *   diagonalmente dominantes) para evitar esse problema.
+ * - Por simplicidade e para minimizar o número de transferências
+ *   Host<->Device (o que prejudicaria o speedup que é o objetivo do
+ *   trabalho), a versão GPU NÃO faz pivotamento parcial. Toda a eliminação
+ *   roda no device sem nenhuma sincronização intermediária; a verificação
+ *   de pivô nulo é feita em uma única varredura no host, depois que a
+ *   matriz já voltou inteira do device (evitando um cudaMemcpy síncrono a
+ *   cada passo, que seria um gargalo grave de desempenho). Use matrizes de
+ *   teste bem-condicionadas (por exemplo, diagonalmente dominantes) para
+ *   evitar esse problema.
  *
  * Compilação (Makefile original do professor):
  * nvcc -lineinfo -lm -o equation equation_test.cu gpu_lib.cu
@@ -301,22 +304,6 @@ void processaVetoresGPU(data_t *hmA, data_t *hvB, int nIncognitas) {
 
     for (int passo = 1; passo < nIncognitas; passo++) {
 
-        /* verifica se o pivô atual é nulo (sem pivotamento parcial na GPU) */
-        data_t pivoHost;
-        CUDA_CHECK(cudaMemcpy(&pivoHost,
-                               dmA + (size_t)(passo - 1) * nIncognitas + (passo - 1),
-                               sizeof(data_t), cudaMemcpyDeviceToHost),
-                   ERRO_CUDA_MEMCPY);
-
-        if (fabsf(pivoHost) < TOLERANCIA_PIVO) {
-            fprintf(stderr, "Erro %d: Pivo nulo na linha %d (processaVetoresGPU).\n",
-                    ERRO_PIVO_NULO_GPU, passo - 1);
-            cudaFree(dmA);
-            cudaFree(dvB);
-            cudaFree(dMultiplicadores);
-            exit(ERRO_PIVO_NULO_GPU);
-        }
-
         kernelCalculaMultiplicadores<<<blocksPerGrid, threadsPerBlock>>>(
             dmA, dvB, dMultiplicadores, nIncognitas, passo);
         CUDA_CHECK(cudaGetLastError(), ERRO_CUDA_KERNEL);
@@ -332,4 +319,20 @@ void processaVetoresGPU(data_t *hmA, data_t *hvB, int nIncognitas) {
     cudaFree(dmA);
     cudaFree(dvB);
     cudaFree(dMultiplicadores);
+
+    /*
+     * Verifica, em uma única varredura no host (após todo o processamento
+     * já ter sido feito na GPU), se algum dos pivôs usados foi nulo. Cada
+     * posição da diagonal congela com o valor do pivô usado naquele passo
+     * assim que a linha correspondente deixa de ser tocada pelos passos
+     * seguintes, então essa varredura final é equivalente a checar o pivô
+     * a cada passo, mas sem o custo de 1 cudaMemcpy síncrono por passo.
+     */
+    for (int i = 0; i < nIncognitas; i++) {
+        if (fabsf(matriz(hmA, i, i, nIncognitas)) < TOLERANCIA_PIVO) {
+            fprintf(stderr, "Erro %d: Pivo nulo na linha %d (processaVetoresGPU).\n",
+                    ERRO_PIVO_NULO_GPU, i);
+            exit(ERRO_PIVO_NULO_GPU);
+        }
+    }
 }
